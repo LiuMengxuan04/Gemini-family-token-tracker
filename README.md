@@ -10,7 +10,7 @@ An **Antigravity** plugin for family-shared accounts. It automatically tracks pe
 
 ### Features
 
-- **Clean Member Summary + Progress Bar**: Instead of flooding Notion with per-day/per-model rows, each family member has **one summary row** showing a visual progress bar (`🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜ 3.62M (219 calls)`, or `🟩🟩🟩🟩🟩🟩⬜⬜⬜⬜ 62.5%` if a quota is set), total Billable Tokens, Calls, Start Date (`Since`), and `Last Updated`.
+- **Clean Member Summary + Progress Bar (Multi-Device Auto-Merge)**: Instead of flooding Notion with per-day/per-model rows, each family member has **one summary row per cycle** showing a visual progress bar (`🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜ 3.62M (219 calls)`, or `🟩🟩🟩🟩🟩🟩⬜⬜⬜⬜ 62.5%` if a quota is set), total Billable Tokens, Calls, Start Date (`Since`), and `Last Updated`. If the same person uses multiple computers (set the same `--member` name on each machine), their usage is **automatically merged into that single row** via per-device snapshots (`Device Breakdown`) without overwriting each other.
 - **Configurable Start Date (`since`)**: Automatically starts counting from the moment the plugin is installed on each device. You can change it anytime to any date (e.g. `--since 2026-11-01`), reset to now (`--since now`), or count all history (`--since all`).
 - **Zero-LLM Auto-Sync on Every Turn (Default)**: When configured with a Notion dashboard link and a free Notion Internal Integration Token, every `Stop` hook spawns a detached background process that updates your summary row directly via the Notion REST API — **0 extra LLM calls, 0 added chat latency**.
 - **Ready Out of the Box (No Quota Limit by Default)**: Automatically uses the current system login account (`getpass.getuser()`) as the member name. Daily and monthly limits default to `0` (unlimited).
@@ -108,7 +108,7 @@ python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py config 
 
 ### 功能特点
 
-- **极简汇总看板 + 进度条展示**：不再按天/按模型刷屏，每位家庭成员在 Notion 看板中只占**一行总汇总**，自带可视化进度条（不限额时显示消耗刻度条 `🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜ 3.62M (219 calls)`；设置参考额度后显示百分比进度条 `🟩🟩🟩🟩🟩🟩⬜⬜⬜⬜ 62.5%`）、起始统计时间（`Since`）与最后更新时间（`Last Updated`）。
+- **极简汇总看板 + 进度条展示（支持一人多设备自动合并）**：不再按天/按模型刷屏，每位家庭成员在每个周期只占**唯一一行总汇总**，自带可视化进度条（不限额时显示消耗刻度条 `🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜ 3.62M (219 calls)`；设置参考额度后显示百分比进度条 `🟩🟩🟩🟩🟩🟩⬜⬜⬜⬜ 62.5%`）、起始统计时间（`Since`）与最后更新时间（`Last Updated`）。同一个人使用多台电脑时，只需将各台设备的 `--member` 设为相同名称，插件会自动通过隐藏的 `Device Breakdown` 分设备快照将多机消耗**无冲突累加合并到同一行**，绝不互相覆盖。
 - **支持自定义起始日期（`since`）**：默认自动从插件安装/首次初始化的那一刻开始统计，也可随时设置为指定日期（如账单日 `--since 2026-11-01`）、立即归零重算（`--since now`）或统计全部历史（`--since all`）。
 - **默认自动同步（零额外模型消耗）**：配置 Notion 看板链接和免费的 Notion Integration Token 后，每次对话结束（`Stop` 钩子）会自动拉起后台静默进程直连 Notion REST API 更新自己的汇总行——**不额外调用大模型、零 Token 消耗、不阻塞对话**。
 - **开箱即用、默认不限额**：自动读取当前电脑的登录用户名作为成员名，默认不设置任何每日/每月上限。

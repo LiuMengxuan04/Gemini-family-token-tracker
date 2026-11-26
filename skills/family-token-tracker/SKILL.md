@@ -101,14 +101,15 @@ Call `notion_notion` tool `notion-create-database` with:
     "Output Tokens" NUMBER,
     "Cache Read Tokens" NUMBER,
     "Total Tokens" NUMBER,
-    "Sync Key" RICH_TEXT
+    "Sync Key" RICH_TEXT,
+    "Device Breakdown" RICH_TEXT
   )
   ```
 
 After creating the database, optionally call `notion-update-view` on its default
 view so `"Progress"` is placed immediately after `"Record"`, rows are grouped
-by `"Cycle"` (newest cycle as its own sub-table!), and `"Sync Key"` is hidden:
-`GROUP BY "Cycle"; SHOW "Record", "Progress", "Billable Tokens", "Calls", "Since", "Last Updated", "Device", "Input Tokens", "Output Tokens", "Cache Read Tokens", "Total Tokens", "Member"; HIDE "Sync Key"; WIDTH "Progress" 320; SORT BY "Billable Tokens" DESC`.
+by `"Cycle"` (newest cycle as its own sub-table!), and `"Sync Key"` / `"Device Breakdown"` are hidden:
+`GROUP BY "Cycle"; SHOW "Record", "Progress", "Billable Tokens", "Calls", "Since", "Last Updated", "Device", "Input Tokens", "Output Tokens", "Cache Read Tokens", "Total Tokens", "Member"; HIDE "Sync Key", "Device Breakdown"; WIDTH "Progress" 320; SORT BY "Billable Tokens" DESC`.
 
 Save the URL/ID via `tracker.py config` and display the **Sharing & Permissions
 Guide** above.

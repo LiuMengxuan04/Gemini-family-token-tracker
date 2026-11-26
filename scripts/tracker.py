@@ -557,7 +557,7 @@ def cmd_hook_pre_invocation(_args: argparse.Namespace) -> None:
 def get_summary_pending_item(
     conn: sqlite3.Connection, cfg: Dict[str, Any], force: bool = False
 ) -> List[Dict[str, Any]]:
-    """Build the single aggregated summary row for this cycle + member + device."""
+    """Build the single aggregated summary row for this cycle + member (multi-device merged)."""
     member = str(cfg.get("member") or getpass.getuser())
     device = str(cfg.get("device") or socket.gethostname().split(".")[0])
     cycle = str(cfg.get("cycle") or default_cycle_name())
@@ -565,7 +565,7 @@ def get_summary_pending_item(
     s_sql, s_params = since_filter_sql(since)
 
     totals = query_period_totals(conn, s_sql, s_params)
-    sync_key = f"summary|{cycle}|{member}|{device}"
+    sync_key = f"summary|{cycle}|{member}"
 
     prev_row = conn.execute(
         "SELECT * FROM notion_sync_log WHERE sync_key = ?", (sync_key,)
@@ -586,6 +586,16 @@ def get_summary_pending_item(
     progress_text = build_progress_bar(used, limit, totals["calls"])
     now_iso = utc_now_iso()
     since_date_val = since if since else dt.datetime.now().astimezone().strftime("%Y-%m-%d")
+    device_breakdown = {
+        device: {
+            "in": int(totals["input_tokens"]),
+            "cr": int(totals["cache_read_tokens"]),
+            "out": int(totals["output_tokens"]),
+            "calls": int(totals["calls"]),
+            "since": since_date_val,
+            "at": now_iso,
+        }
+    }
 
     return [
         {
@@ -598,6 +608,7 @@ def get_summary_pending_item(
             "since": since_date_val,
             "progress": progress_text,
             "last_updated": now_iso,
+            "device_breakdown": device_breakdown,
             "properties": {
                 "Record": member,
                 "Cycle": cycle,
@@ -615,10 +626,163 @@ def get_summary_pending_item(
                 "Total Tokens": totals["total_tokens"],
                 "Calls": totals["calls"],
                 "Sync Key": sync_key,
+                "Device Breakdown": json.dumps(
+                    device_breakdown, ensure_ascii=False, separators=(",", ":")
+                ),
             },
             "raw": totals,
         }
     ]
+
+
+def notion_rich_text_chunks(text: str, chunk_size: int = 1900) -> List[Dict[str, Any]]:
+    if not text:
+        return []
+    return [
+        {"text": {"content": text[i : i + chunk_size]}}
+        for i in range(0, len(text), chunk_size)
+    ]
+
+
+def extract_notion_plain_text(prop: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(prop, dict):
+        return ""
+    items = prop.get("rich_text") or prop.get("title") or []
+    return "".join(str(t.get("plain_text") or "") for t in items if isinstance(t, dict))
+
+
+def _normalize_device_entry(raw: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "in": max(0, int(raw.get("in") or 0)),
+        "cr": max(0, int(raw.get("cr") or 0)),
+        "out": max(0, int(raw.get("out") or 0)),
+        "calls": max(0, int(raw.get("calls") or 0)),
+        "since": str(raw.get("since") or ""),
+        "at": str(raw.get("at") or ""),
+    }
+
+
+def extract_page_breakdown(page: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Extract per-device usage snapshots from a Notion page (supports legacy single-device rows)."""
+    props = page.get("properties") or {}
+    bd_text = extract_notion_plain_text(props.get("Device Breakdown")).strip()
+    if bd_text:
+        try:
+            parsed = json.loads(bd_text)
+            if isinstance(parsed, dict) and parsed:
+                out: Dict[str, Dict[str, Any]] = {}
+                for dev_name, entry in parsed.items():
+                    if isinstance(dev_name, str) and dev_name.strip() and isinstance(entry, dict):
+                        out[dev_name.strip()] = _normalize_device_entry(entry)
+                if out:
+                    return out
+        except Exception:
+            pass
+
+    # Fallback for legacy single-device rows without Device Breakdown
+    dev_name = extract_notion_plain_text(props.get("Device")).strip()
+    if not dev_name:
+        sk = extract_notion_plain_text(props.get("Sync Key")).strip()
+        parts = sk.split("|")
+        if len(parts) == 4 and parts[0] == "summary" and parts[3].strip():
+            dev_name = parts[3].strip()
+    if not dev_name:
+        dev_name = "unknown-device"
+
+    in_tok = int((props.get("Input Tokens") or {}).get("number") or 0)
+    cr_tok = int((props.get("Cache Read Tokens") or {}).get("number") or 0)
+    out_tok = int((props.get("Output Tokens") or {}).get("number") or 0)
+    calls = int((props.get("Calls") or {}).get("number") or 0)
+    since_start = str(((props.get("Since") or {}).get("date") or {}).get("start") or "")
+    updated_start = str(((props.get("Last Updated") or {}).get("date") or {}).get("start") or "")
+
+    return {
+        dev_name: _normalize_device_entry(
+            {
+                "in": in_tok,
+                "cr": cr_tok,
+                "out": out_tok,
+                "calls": calls,
+                "since": normalize_since(since_start) if since_start else "",
+                "at": updated_start,
+            }
+        )
+    }
+
+
+def merge_remote_breakdowns(pages: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Merge per-device snapshots across one or more Notion rows for the same cycle + member."""
+    merged: Dict[str, Dict[str, Any]] = {}
+    for page in pages:
+        bd = extract_page_breakdown(page)
+        for dev_name, entry in bd.items():
+            prev = merged.get(dev_name)
+            if prev is None:
+                merged[dev_name] = dict(entry)
+                continue
+            # Prefer the snapshot with a newer timestamp, or higher total calls/tokens
+            prev_at = prev.get("at") or ""
+            cur_at = entry.get("at") or ""
+            prev_score = (prev_at, prev["calls"], prev["in"] + prev["out"])
+            cur_score = (cur_at, entry["calls"], entry["in"] + entry["out"])
+            if cur_score >= prev_score:
+                merged[dev_name] = dict(entry)
+    return merged
+
+
+def build_merged_item(
+    item: Dict[str, Any],
+    remote_breakdown: Dict[str, Dict[str, Any]],
+    cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Overlay this device's local totals onto remote_breakdown and compute combined member totals."""
+    device = item["device"]
+    local_raw = item["raw"]
+    breakdown: Dict[str, Dict[str, Any]] = {
+        k: _normalize_device_entry(v) for k, v in remote_breakdown.items()
+    }
+    breakdown[device] = _normalize_device_entry(
+        {
+            "in": local_raw["input_tokens"],
+            "cr": local_raw["cache_read_tokens"],
+            "out": local_raw["output_tokens"],
+            "calls": local_raw["calls"],
+            "since": item["since"],
+            "at": item["last_updated"],
+        }
+    )
+
+    total_in = sum(e["in"] for e in breakdown.values())
+    total_cr = sum(e["cr"] for e in breakdown.values())
+    total_out = sum(e["out"] for e in breakdown.values())
+    total_calls = sum(e["calls"] for e in breakdown.values())
+    merged_raw = {
+        "input_tokens": total_in,
+        "cache_read_tokens": total_cr,
+        "output_tokens": total_out,
+        "billable_tokens": total_in + total_out,
+        "total_tokens": total_in + total_cr + total_out,
+        "calls": total_calls,
+    }
+
+    # Earliest non-empty `since` across devices in this cycle
+    since_candidates = [e["since"] for e in breakdown.values() if e.get("since")]
+    merged_since = item["since"]
+    if since_candidates:
+        merged_since = min(since_candidates, key=lambda s: since_to_epoch(s) or float("inf"))
+
+    used = counted_tokens(merged_raw, cfg)
+    limit = int(cfg.get("monthly_limit") or cfg.get("daily_limit") or 0)
+    merged_progress = build_progress_bar(used, limit, total_calls)
+    merged_devices = " + ".join(sorted(breakdown.keys()))
+
+    merged_item = dict(item)
+    merged_item["device"] = merged_devices
+    merged_item["since"] = merged_since
+    merged_item["progress"] = merged_progress
+    merged_item["device_breakdown"] = breakdown
+    merged_item["raw"] = merged_raw
+    return merged_item
 
 
 def notion_api_request(
@@ -641,7 +805,7 @@ def notion_api_request(
 
 
 def ensure_summary_schema(token: str, db_id: str) -> None:
-    """Ensure the target Notion database has Cycle, Progress, Since, and Last Updated."""
+    """Ensure the target Notion database has Cycle, Progress, Since, Last Updated, and Device Breakdown."""
     try:
         notion_api_request(
             token,
@@ -653,11 +817,33 @@ def ensure_summary_schema(token: str, db_id: str) -> None:
                     "Progress": {"rich_text": {}},
                     "Since": {"date": {}},
                     "Last Updated": {"date": {}},
+                    "Device Breakdown": {"rich_text": {}},
                 }
             },
         )
     except Exception:
         pass
+
+
+def query_member_cycle_pages(
+    token: str, db_id: str, cycle: str, member: str
+) -> List[Dict[str, Any]]:
+    """Fetch all active rows for a given (cycle, member) — covers both unified and legacy per-device rows."""
+    q_res = notion_api_request(
+        token,
+        "POST",
+        f"/databases/{db_id}/query",
+        {
+            "filter": {
+                "and": [
+                    {"property": "Cycle", "select": {"equals": cycle}},
+                    {"property": "Member", "select": {"equals": member}},
+                ]
+            },
+            "page_size": 50,
+        },
+    )
+    return [p for p in (q_res.get("results") or []) if not p.get("archived")]
 
 
 def check_remote_latest_cycle(
@@ -706,12 +892,14 @@ def check_remote_latest_cycle(
 
 def build_notion_rest_properties(item: Dict[str, Any]) -> Dict[str, Any]:
     raw = item["raw"]
-    return {
+    breakdown = item.get("device_breakdown") or {}
+    bd_json = json.dumps(breakdown, ensure_ascii=False, separators=(",", ":")) if breakdown else ""
+    props: Dict[str, Any] = {
         "Record": {"title": [{"text": {"content": item["member"]}}]},
         "Cycle": {"select": {"name": item["cycle"]}},
         "Member": {"select": {"name": item["member"]}},
-        "Device": {"rich_text": [{"text": {"content": item["device"]}}]},
-        "Progress": {"rich_text": [{"text": {"content": item["progress"]}}]},
+        "Device": {"rich_text": notion_rich_text_chunks(item["device"])},
+        "Progress": {"rich_text": notion_rich_text_chunks(item["progress"])},
         "Since": {"date": {"start": item["since"]}},
         "Last Updated": {"date": {"start": item["last_updated"]}},
         "Input Tokens": {"number": raw["input_tokens"]},
@@ -720,8 +908,11 @@ def build_notion_rest_properties(item: Dict[str, Any]) -> Dict[str, Any]:
         "Billable Tokens": {"number": raw["billable_tokens"]},
         "Total Tokens": {"number": raw["total_tokens"]},
         "Calls": {"number": raw["calls"]},
-        "Sync Key": {"rich_text": [{"text": {"content": item["sync_key"]}}]},
+        "Sync Key": {"rich_text": notion_rich_text_chunks(item["sync_key"])},
     }
+    if bd_json:
+        props["Device Breakdown"] = {"rich_text": notion_rich_text_chunks(bd_json)}
+    return props
 
 
 def upsert_sync_log(conn: sqlite3.Connection, item: Dict[str, Any], page_id: str) -> None:
@@ -789,6 +980,7 @@ def run_direct_sync(
         created = 0
         updated = 0
         archived_legacy = 0
+        merged_devices_count = 1
         followed_cycle = None
         errors: List[str] = []
         try:
@@ -796,10 +988,10 @@ def run_direct_sync(
                 ensure_summary_schema(token, db_id)
                 q_all = notion_api_request(token, "POST", f"/databases/{db_id}/query", {"page_size": 100})
                 for p in q_all.get("results") or []:
-                    sk_prop = (p.get("properties") or {}).get("Sync Key", {}).get("rich_text") or []
-                    sk_val = "".join(t.get("plain_text", "") for t in sk_prop)
-                    # Keep only new 4-part summary|<cycle>|<member>|<device> keys
-                    if len(sk_val.split("|")) != 4 or not sk_val.startswith("summary|"):
+                    sk_val = extract_notion_plain_text((p.get("properties") or {}).get("Sync Key")).strip()
+                    parts = sk_val.split("|")
+                    # Keep unified 3-part summary|<cycle>|<member> and 4-part summary rows (merged during sync)
+                    if not (sk_val.startswith("summary|") and len(parts) in (3, 4)):
                         notion_api_request(token, "PATCH", f"/pages/{p['id']}", {"archived": True})
                         archived_legacy += 1
                 conn.execute("DELETE FROM notion_sync_log")
@@ -813,27 +1005,40 @@ def run_direct_sync(
             )
             for item in pending:
                 try:
-                    props = build_notion_rest_properties(item)
-                    page_id = item.get("notion_page_id")
-
-                    if not page_id:
+                    matched_pages = query_member_cycle_pages(
+                        token, db_id, item["cycle"], item["member"]
+                    )
+                    needs_schema = not matched_pages or any(
+                        "Device Breakdown" not in (p.get("properties") or {})
+                        for p in matched_pages
+                    )
+                    if needs_schema:
                         ensure_summary_schema(token, db_id)
-                        q_res = notion_api_request(
-                            token,
-                            "POST",
-                            f"/databases/{db_id}/query",
-                            {
-                                "filter": {
-                                    "property": "Sync Key",
-                                    "rich_text": {"equals": item["sync_key"]},
-                                },
-                                "page_size": 1,
-                            },
-                        )
-                        results = q_res.get("results") or []
-                        if results:
-                            page_id = results[0].get("id")
 
+                    remote_breakdown = merge_remote_breakdowns(matched_pages)
+                    merged_item = build_merged_item(item, remote_breakdown, cfg)
+                    merged_devices_count = len(merged_item.get("device_breakdown") or {})
+                    props = build_notion_rest_properties(merged_item)
+
+                    # Pick primary page: prefer exact unified Sync Key, then cached page_id, else first match
+                    primary_page = None
+                    cached_pid = item.get("notion_page_id")
+                    for p in matched_pages:
+                        sk_val = extract_notion_plain_text(
+                            (p.get("properties") or {}).get("Sync Key")
+                        ).strip()
+                        if sk_val == item["sync_key"]:
+                            primary_page = p
+                            break
+                    if primary_page is None and cached_pid:
+                        for p in matched_pages:
+                            if p.get("id") == cached_pid:
+                                primary_page = p
+                                break
+                    if primary_page is None and matched_pages:
+                        primary_page = matched_pages[0]
+
+                    page_id = str(primary_page.get("id") or "") if primary_page else ""
                     if page_id:
                         notion_api_request(
                             token,
@@ -855,6 +1060,18 @@ def run_direct_sync(
                         page_id = str(c_res.get("id") or "")
                         created += 1
 
+                    # Archive any extra duplicate/legacy per-device rows that were just merged in
+                    for p in matched_pages:
+                        extra_id = str(p.get("id") or "")
+                        if extra_id and extra_id != page_id:
+                            try:
+                                notion_api_request(
+                                    token, "PATCH", f"/pages/{extra_id}", {"archived": True}
+                                )
+                                archived_legacy += 1
+                            except Exception:
+                                pass
+
                     if page_id:
                         upsert_sync_log(conn, item, page_id)
                 except urllib.error.HTTPError as e:
@@ -870,6 +1087,8 @@ def run_direct_sync(
             "synced_at": utc_now_iso(),
             "cycle": cfg.get("cycle", ""),
             "since": cfg.get("since", ""),
+            "member": cfg.get("member", ""),
+            "devices_merged": merged_devices_count,
             "followed_remote_cycle": followed_cycle,
             "created": created,
             "updated": updated,
