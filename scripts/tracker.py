@@ -2,10 +2,10 @@
 """Family Token Tracker for Antigravity.
 
 Tracks token consumption from Antigravity transcript.jsonl files into a local
-SQLite database, aggregates total usage per member+device starting from a
-configurable `since` date/timestamp (defaulting to plugin installation time),
-and supports zero-LLM background auto-sync to a shared Notion dashboard with a
-visual progress bar.
+SQLite database, aggregates total usage per member+device within the active
+Cycle (starting from `since`, defaulting to plugin installation time), supports
+one-person reset with whole-family auto-follow via Notion, and runs zero-LLM
+background auto-sync on every Stop hook.
 """
 
 from __future__ import annotations
@@ -45,10 +45,19 @@ def utc_now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def default_cycle_name(existing_cycle: str = "") -> str:
+    now_local = dt.datetime.now().astimezone()
+    day_name = now_local.strftime("%Y-%m-%d")
+    if existing_cycle != day_name:
+        return day_name
+    return now_local.strftime("%Y-%m-%d %H:%M")
+
+
 def default_config() -> Dict[str, Any]:
     return {
         "member": getpass.getuser(),
         "device": socket.gethostname().split(".")[0],
+        "cycle": default_cycle_name(),
         "since": utc_now_iso(),
         "daily_limit": 0,
         "monthly_limit": 0,
@@ -56,6 +65,7 @@ def default_config() -> Dict[str, Any]:
         "warn_threshold_pct": 80,
         "remind_cooldown_minutes": 60,
         "auto_sync": True,
+        "auto_follow_reset": True,
         "notion": {
             "database_url": "",
             "database_id": "",
@@ -96,7 +106,6 @@ def normalize_since(value: str) -> str:
         return utc_now_iso()
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
         return v
-    # Try parsing ISO datetime and normalize to UTC Z string
     try:
         parsed = dt.datetime.fromisoformat(v.replace("Z", "+00:00"))
         if parsed.tzinfo is None:
@@ -104,6 +113,22 @@ def normalize_since(value: str) -> str:
         return parsed.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     except Exception:
         return v
+
+
+def since_to_epoch(since: str) -> float:
+    """Convert a `since` string (YYYY-MM-DD or ISO timestamp) to UTC epoch seconds for comparison."""
+    if not since:
+        return 0.0
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", since):
+            local_dt = dt.datetime.strptime(since, "%Y-%m-%d").astimezone()
+            return local_dt.timestamp()
+        parsed = dt.datetime.fromisoformat(since.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed.timestamp()
+    except Exception:
+        return 0.0
 
 
 def load_config() -> Dict[str, Any]:
@@ -118,14 +143,17 @@ def load_config() -> Dict[str, Any]:
     except Exception:
         return default_config()
     merged = default_config()
-    # Keep existing since if present (even if empty string ""), otherwise default to now
     has_since = "since" in raw
+    has_cycle = "cycle" in raw and bool(str(raw.get("cycle") or "").strip())
     for k, v in raw.items():
         if k == "notion" and isinstance(v, dict):
             merged["notion"].update(v)
         else:
             merged[k] = v
-    if not has_since:
+    if not has_cycle:
+        since_val = str(merged.get("since") or "")
+        merged["cycle"] = since_val[:10] if len(since_val) >= 10 else default_cycle_name()
+    if not has_since or not has_cycle:
         save_config(merged)
     if not merged["notion"].get("database_id") and merged["notion"].get("database_url"):
         merged["notion"]["database_id"] = extract_notion_id(merged["notion"]["database_url"])
@@ -208,7 +236,6 @@ def parse_utc_to_local_date(ts: str) -> Tuple[str, str]:
 
 
 def since_filter_sql(since: str) -> Tuple[str, Tuple[Any, ...]]:
-    """Return SQL WHERE clause and params for the configured `since` boundary."""
     if not since:
         return "1 = 1", ()
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", since):
@@ -331,7 +358,6 @@ def fmt_num(n: int) -> str:
 
 
 def build_progress_bar(used: int, limit: int, calls: int) -> str:
-    """Build a visual Unicode progress bar for Notion display."""
     width = 10
     if limit > 0:
         pct = (used / limit) * 100.0
@@ -344,7 +370,6 @@ def build_progress_bar(used: int, limit: int, calls: int) -> str:
             bar = "🟩" * filled + "⬜" * (width - filled)
         return f"{bar} {pct:.1f}% ({fmt_num(used)} / {fmt_num(limit)})"
 
-    # Unlimited mode: show a clean logarithmic/stepped visual gauge + totals
     if used <= 0:
         filled = 0
     elif used < 100_000:
@@ -532,14 +557,15 @@ def cmd_hook_pre_invocation(_args: argparse.Namespace) -> None:
 def get_summary_pending_item(
     conn: sqlite3.Connection, cfg: Dict[str, Any], force: bool = False
 ) -> List[Dict[str, Any]]:
-    """Build the single aggregated summary row for this member+device since `cfg['since']`."""
+    """Build the single aggregated summary row for this cycle + member + device."""
     member = str(cfg.get("member") or getpass.getuser())
     device = str(cfg.get("device") or socket.gethostname().split(".")[0])
+    cycle = str(cfg.get("cycle") or default_cycle_name())
     since = str(cfg.get("since") or "")
     s_sql, s_params = since_filter_sql(since)
 
     totals = query_period_totals(conn, s_sql, s_params)
-    sync_key = f"summary|{member}|{device}"
+    sync_key = f"summary|{cycle}|{member}|{device}"
 
     prev_row = conn.execute(
         "SELECT * FROM notion_sync_log WHERE sync_key = ?", (sync_key,)
@@ -566,6 +592,7 @@ def get_summary_pending_item(
             "action": "update" if prev else "create",
             "sync_key": sync_key,
             "notion_page_id": prev["notion_page_id"] if prev else None,
+            "cycle": cycle,
             "member": member,
             "device": device,
             "since": since_date_val,
@@ -573,6 +600,7 @@ def get_summary_pending_item(
             "last_updated": now_iso,
             "properties": {
                 "Record": member,
+                "Cycle": cycle,
                 "Member": member,
                 "Device": device,
                 "Progress": progress_text,
@@ -613,7 +641,7 @@ def notion_api_request(
 
 
 def ensure_summary_schema(token: str, db_id: str) -> None:
-    """Ensure the target Notion database has Progress, Since, and Last Updated properties."""
+    """Ensure the target Notion database has Cycle, Progress, Since, and Last Updated."""
     try:
         notion_api_request(
             token,
@@ -621,6 +649,7 @@ def ensure_summary_schema(token: str, db_id: str) -> None:
             f"/databases/{db_id}",
             {
                 "properties": {
+                    "Cycle": {"select": {}},
                     "Progress": {"rich_text": {}},
                     "Since": {"date": {}},
                     "Last Updated": {"date": {}},
@@ -631,10 +660,55 @@ def ensure_summary_schema(token: str, db_id: str) -> None:
         pass
 
 
+def check_remote_latest_cycle(
+    token: str, db_id: str, cfg: Dict[str, Any]
+) -> Optional[Dict[str, str]]:
+    """Check if another family member started a newer Cycle in Notion.
+
+    If `remote_since` is strictly newer than local `since` and `remote_cycle`
+    differs from local `cycle`, automatically adopt the new cycle & since!
+    """
+    if not cfg.get("auto_follow_reset", True):
+        return None
+    try:
+        res = notion_api_request(
+            token,
+            "POST",
+            f"/databases/{db_id}/query",
+            {
+                "filter": {"property": "Cycle", "select": {"is_not_empty": True}},
+                "sorts": [{"property": "Since", "direction": "descending"}],
+                "page_size": 1,
+            },
+        )
+        results = res.get("results") or []
+        if not results:
+            return None
+        props = results[0].get("properties") or {}
+        cycle_obj = (props.get("Cycle") or {}).get("select") or {}
+        remote_cycle = str(cycle_obj.get("name") or "").strip()
+        since_obj = (props.get("Since") or {}).get("date") or {}
+        remote_since = normalize_since(str(since_obj.get("start") or ""))
+        if not remote_cycle or not remote_since:
+            return None
+
+        local_cycle = str(cfg.get("cycle") or "")
+        local_since = str(cfg.get("since") or "")
+        if remote_cycle != local_cycle and since_to_epoch(remote_since) > since_to_epoch(local_since) + 1.0:
+            cfg["cycle"] = remote_cycle
+            cfg["since"] = remote_since
+            save_config(cfg)
+            return {"cycle": remote_cycle, "since": remote_since}
+    except Exception:
+        return None
+    return None
+
+
 def build_notion_rest_properties(item: Dict[str, Any]) -> Dict[str, Any]:
     raw = item["raw"]
     return {
         "Record": {"title": [{"text": {"content": item["member"]}}]},
+        "Cycle": {"select": {"name": item["cycle"]}},
         "Member": {"select": {"name": item["member"]}},
         "Device": {"rich_text": [{"text": {"content": item["device"]}}]},
         "Progress": {"rich_text": [{"text": {"content": item["progress"]}}]},
@@ -681,10 +755,14 @@ def upsert_sync_log(conn: sqlite3.Connection, item: Dict[str, Any], page_id: str
     conn.commit()
 
 
-def cmd_sync_notion_direct(args: argparse.Namespace) -> None:
-    """Zero-LLM direct sync of the single member summary row to Notion REST API."""
+def run_direct_sync(
+    cfg: Dict[str, Any],
+    force: bool = False,
+    quiet: bool = False,
+    cleanup_legacy: bool = False,
+    skip_remote_check: bool = False,
+) -> Dict[str, Any]:
     ensure_data_dir()
-    cfg = load_config()
     notion = cfg.get("notion") or {}
     token = str(notion.get("api_token") or os.environ.get("NOTION_API_TOKEN") or "").strip()
     db_id = str(notion.get("database_id") or extract_notion_id(notion.get("database_url", ""))).strip()
@@ -694,37 +772,45 @@ def cmd_sync_notion_direct(args: argparse.Namespace) -> None:
             "ok": False,
             "error": "Missing notion.api_token or notion.database_id (or database_url).",
         }
-        if not args.quiet:
+        if not quiet:
             print(json.dumps(res, ensure_ascii=False, indent=2))
-        return
+        return res
 
     with SYNC_LOCK_PATH.open("w", encoding="utf-8") as lock_file:
         try:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            if not args.quiet:
-                print(json.dumps({"ok": True, "skipped": "another sync is in progress"}))
-            return
+            res = {"ok": True, "skipped": "another sync is in progress"}
+            if not quiet:
+                print(json.dumps(res))
+            return res
 
         conn = open_db()
         created = 0
         updated = 0
         archived_legacy = 0
+        followed_cycle = None
         errors: List[str] = []
         try:
-            if args.cleanup_legacy:
+            if cleanup_legacy:
                 ensure_summary_schema(token, db_id)
                 q_all = notion_api_request(token, "POST", f"/databases/{db_id}/query", {"page_size": 100})
                 for p in q_all.get("results") or []:
                     sk_prop = (p.get("properties") or {}).get("Sync Key", {}).get("rich_text") or []
                     sk_val = "".join(t.get("plain_text", "") for t in sk_prop)
-                    if not sk_val.startswith("summary|"):
+                    # Keep only new 4-part summary|<cycle>|<member>|<device> keys
+                    if len(sk_val.split("|")) != 4 or not sk_val.startswith("summary|"):
                         notion_api_request(token, "PATCH", f"/pages/{p['id']}", {"archived": True})
                         archived_legacy += 1
-                conn.execute("DELETE FROM notion_sync_log WHERE sync_key NOT LIKE 'summary|%'")
+                conn.execute("DELETE FROM notion_sync_log")
                 conn.commit()
 
-            pending = get_summary_pending_item(conn, cfg, force=args.force or args.cleanup_legacy)
+            if not skip_remote_check:
+                followed_cycle = check_remote_latest_cycle(token, db_id, cfg)
+
+            pending = get_summary_pending_item(
+                conn, cfg, force=force or cleanup_legacy or bool(followed_cycle)
+            )
             for item in pending:
                 try:
                     props = build_notion_rest_properties(item)
@@ -782,14 +868,58 @@ def cmd_sync_notion_direct(args: argparse.Namespace) -> None:
         status = {
             "ok": len(errors) == 0,
             "synced_at": utc_now_iso(),
+            "cycle": cfg.get("cycle", ""),
+            "since": cfg.get("since", ""),
+            "followed_remote_cycle": followed_cycle,
             "created": created,
             "updated": updated,
             "archived_legacy": archived_legacy,
             "errors": errors,
         }
         save_last_sync(status)
-        if not args.quiet:
+        if not quiet:
             print(json.dumps(status, ensure_ascii=False, indent=2))
+        return status
+
+
+def cmd_sync_notion_direct(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    run_direct_sync(
+        cfg,
+        force=args.force,
+        quiet=args.quiet,
+        cleanup_legacy=args.cleanup_legacy,
+        skip_remote_check=args.no_follow,
+    )
+
+
+def cmd_reset(args: argparse.Namespace) -> None:
+    """Start a brand-new Cycle without overwriting previous cycles in Notion."""
+    cfg = load_config()
+    old_cycle = str(cfg.get("cycle") or "")
+    new_cycle = (args.name or "").strip() or default_cycle_name(existing_cycle=old_cycle)
+    new_since = normalize_since(args.since) if args.since else utc_now_iso()
+
+    cfg["cycle"] = new_cycle
+    cfg["since"] = new_since
+    save_config(cfg)
+
+    sync_res = None
+    if not args.no_sync:
+        sync_res = run_direct_sync(cfg, force=True, quiet=True, skip_remote_check=True)
+
+    print(
+        json.dumps(
+            {
+                "previous_cycle": old_cycle,
+                "new_cycle": new_cycle,
+                "new_since": new_since,
+                "sync": sync_res,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 def cmd_backfill(_args: argparse.Namespace) -> None:
@@ -819,6 +949,7 @@ def cmd_backfill(_args: argparse.Namespace) -> None:
             {
                 "scanned_transcripts": scanned_files,
                 "new_events_imported": total_inserted,
+                "cycle": cfg.get("cycle", ""),
                 "since": cfg.get("since", ""),
                 "db_path": str(DB_PATH),
             },
@@ -845,6 +976,9 @@ def cmd_config(args: argparse.Namespace) -> None:
     if args.device is not None:
         cfg["device"] = args.device.strip()
         changed = True
+    if args.cycle is not None:
+        cfg["cycle"] = args.cycle.strip()
+        changed = True
     if args.since is not None:
         cfg["since"] = normalize_since(args.since)
         changed = True
@@ -865,6 +999,9 @@ def cmd_config(args: argparse.Namespace) -> None:
         changed = True
     if args.auto_sync is not None:
         cfg["auto_sync"] = args.auto_sync.lower() in ("1", "true", "yes")
+        changed = True
+    if args.auto_follow_reset is not None:
+        cfg["auto_follow_reset"] = args.auto_follow_reset.lower() in ("1", "true", "yes")
         changed = True
     if args.notion_db_url is not None:
         cfg["notion"]["database_url"] = args.notion_db_url.strip()
@@ -946,10 +1083,12 @@ def cmd_report(args: argparse.Namespace) -> None:
     result = {
         "member": cfg["member"],
         "device": cfg["device"],
+        "cycle": cfg.get("cycle", ""),
         "since": cfg.get("since", ""),
         "period": args.period,
         "progress": build_progress_bar(used, limit, since_totals["calls"]),
         "auto_sync": cfg.get("auto_sync", True),
+        "auto_follow_reset": cfg.get("auto_follow_reset", True),
         "direct_sync_ready": bool(
             (cfg.get("notion") or {}).get("api_token")
             and (cfg.get("notion") or {}).get("database_id")
@@ -975,6 +1114,7 @@ def cmd_notion_pending(args: argparse.Namespace) -> None:
         json.dumps(
             {
                 "notion": mask_config(cfg).get("notion", {}),
+                "cycle": cfg.get("cycle", ""),
                 "since": cfg.get("since", ""),
                 "pending_count": len(pending),
                 "items": pending,
@@ -1036,10 +1176,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync.add_argument("--force", action="store_true")
     p_sync.add_argument("--quiet", action="store_true")
     p_sync.add_argument("--cleanup-legacy", action="store_true")
+    p_sync.add_argument("--no-follow", action="store_true")
+
+    p_reset = sub.add_parser("reset")
+    p_reset.add_argument("--name", help="Optional custom cycle name (e.g. '2026-12' or 'Cycle 2')")
+    p_reset.add_argument("--since", help="Optional start timestamp/date (defaults to now)")
+    p_reset.add_argument("--no-sync", action="store_true")
 
     p_cfg = sub.add_parser("config")
     p_cfg.add_argument("--member")
     p_cfg.add_argument("--device")
+    p_cfg.add_argument("--cycle")
     p_cfg.add_argument("--since")
     p_cfg.add_argument("--daily-limit", type=int)
     p_cfg.add_argument("--monthly-limit", type=int)
@@ -1047,6 +1194,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_cfg.add_argument("--cooldown", type=int)
     p_cfg.add_argument("--count-cache-read")
     p_cfg.add_argument("--auto-sync")
+    p_cfg.add_argument("--auto-follow-reset")
     p_cfg.add_argument("--notion-db-url")
     p_cfg.add_argument("--notion-db-id")
     p_cfg.add_argument("--notion-ds-id")
@@ -1074,6 +1222,7 @@ def main() -> None:
         "hook-pre-invocation": cmd_hook_pre_invocation,
         "backfill": cmd_backfill,
         "sync-notion-direct": cmd_sync_notion_direct,
+        "reset": cmd_reset,
         "config": cmd_config,
         "report": cmd_report,
         "notion-pending": cmd_notion_pending,

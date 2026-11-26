@@ -8,8 +8,8 @@
   "repository": "https://github.com/LiuMengxuan04/Gemini-family-token-tracker",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
+    "Quota reset — start a new tracking cycle / 额度已重置，开启一个新周期",
     "Sync my token usage to our family Notion dashboard / 把我的 Token 消耗同步到家庭 Notion 看板",
-    "Bind our shared Notion dashboard link and sync / 绑定家庭 Notion 看板链接并同步数据",
-    "Show my token usage summary for today and this month / 查看我今天和本月的 Token 消耗统计"
+    "Show my token usage summary for the current cycle / 查看我当前周期的 Token 消耗统计"
   ]
 }

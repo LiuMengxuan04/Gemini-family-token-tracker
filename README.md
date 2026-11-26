@@ -66,6 +66,21 @@ python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py sync-no
 
 From then on, every conversation turn automatically updates your single summary row in Notion with **zero extra model calls**.
 
+### Resetting Quota & Starting a New Cycle (One-Person Reset, Whole-Family Auto-Follow)
+
+Because account quota reset times may not be fixed, **any family member** can start a new cycle whenever the quota refreshes — **without overwriting previous cycles**:
+
+```bash
+# Start a new cycle right now (auto-named e.g. 2026-11-26 18:00)
+python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py reset
+
+# Or give the new cycle a custom name
+python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py reset --name "2026-12"
+```
+
+- Previous cycles stay untouched in Notion (grouped under their own `Cycle` table section).
+- All other family members' devices automatically detect the newer `Cycle` and `Since` timestamp on their next sync (`auto_follow_reset: true`) and start counting from `0` under the new cycle — zero manual steps required!
+
 ### Configure Start Date (`since`) & Optional Settings
 
 ```bash
@@ -152,6 +167,21 @@ python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py sync-no
 ```
 
 配置完成后，以后**每次对话结束都会在后台静默自动更新你的那一行汇总进度条，完全不消耗额外模型 Token**。
+
+### 额度 Reset 开启新周期（一人重置，全家自动跟进、不覆盖旧记录）
+
+因为账号额度重置时间可能不固定，**全家人中只要有任意一人**看到额度刷新，说一句「额度重置了，开个新周期」或运行下面命令，就能在同一个看板下开启新的统计周期，**旧周期记录完整保留绝不覆盖**：
+
+```bash
+# 立即开启新周期（自动按当前日期/时间命名，如 2026-11-26 18:00）
+python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py reset
+
+# 或自定义周期名
+python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py reset --name "2026-12"
+```
+
+- 旧周期数据原封不动保留在 Notion 看板的对应 `Cycle` 分组表格中。
+- 其他家庭成员的电脑在下次后台同步时会自动探测到 Notion 里的新 `Cycle` 和 `Since` 时间点（`auto_follow_reset: true`），**零操作自动切换到新周期从 0 开始累计**！
 
 ### 配置起始日期（`since`）与可选设置
 

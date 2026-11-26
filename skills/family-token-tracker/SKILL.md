@@ -18,9 +18,16 @@ shared Notion dashboard.
 
 - **Username / 用户名**: Automatically defaults to the current logged-in system
   account (`getpass.getuser()`).
-- **Start Date (`since`) / 起始统计时间**: Automatically defaults to the exact
-  moment the plugin is first installed/initialized. Users can change it anytime
-  (`--since YYYY-MM-DD`, `--since now`, or `--since all`).
+- **Start Date (`since`) & Cycle (`cycle`) / 起始时间与周期**: Automatically
+  defaults to the exact moment the plugin is first installed/initialized.
+- **One-Person Reset, Whole-Family Auto-Follow / 一人重置，全家自动切新周期**:
+  - When anyone runs `tracker.py reset` (or tells the agent "额度重置了，开个新周期"),
+    it creates a brand-new `Cycle` in Notion starting from `now` **without
+    overwriting previous cycles** (old cycles remain archived as separate
+    grouped sections in the same Notion database).
+  - Every other family member's device automatically checks Notion's latest
+    `Cycle` before syncing (`auto_follow_reset: true`) and switches to the new
+    cycle & `since` timestamp automatically — zero manual reconfiguration!
 - **Quotas / 额度**: Disabled by default (`daily_limit: 0`, `monthly_limit: 0`,
   no upper limit). When unlimited, `Progress` shows a clean visual gauge bar
   (`🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜ 3.62M (219 calls)`); when a limit is set, it shows a
@@ -83,6 +90,7 @@ Call `notion_notion` tool `notion-create-database` with:
   CREATE TABLE (
     "Record" TITLE,
     "Progress" RICH_TEXT,
+    "Cycle" SELECT,
     "Billable Tokens" NUMBER,
     "Calls" NUMBER,
     "Since" DATE,
@@ -98,9 +106,9 @@ Call `notion_notion` tool `notion-create-database` with:
   ```
 
 After creating the database, optionally call `notion-update-view` on its default
-view so `"Progress"` is placed immediately after `"Record"` and `"Sync Key"` is
-hidden:
-`SHOW "Record", "Progress", "Billable Tokens", "Calls", "Since", "Last Updated", "Device", "Input Tokens", "Output Tokens", "Cache Read Tokens", "Total Tokens", "Member"; HIDE "Sync Key"; WIDTH "Progress" 320; SORT BY "Billable Tokens" DESC`.
+view so `"Progress"` is placed immediately after `"Record"`, rows are grouped
+by `"Cycle"` (newest cycle as its own sub-table!), and `"Sync Key"` is hidden:
+`GROUP BY "Cycle"; SHOW "Record", "Progress", "Billable Tokens", "Calls", "Since", "Last Updated", "Device", "Input Tokens", "Output Tokens", "Cache Read Tokens", "Total Tokens", "Member"; HIDE "Sync Key"; WIDTH "Progress" 320; SORT BY "Billable Tokens" DESC`.
 
 Save the URL/ID via `tracker.py config` and display the **Sharing & Permissions
 Guide** above.
@@ -117,7 +125,25 @@ Guide** above.
    update the single summary page via `notion-create-pages` /
    `notion-update-page`, and call `tracker.py notion-mark-synced`.
 
-### 4. Configure Start Date (`since`), Member Name, or Optional Quotas
+### 4. Start a New Cycle on Quota Reset (Without Overwriting History)
+
+When any family member sees the account quota reset and says "额度重置了，开个新周期" / "Quota reset, start a new cycle":
+
+```bash
+python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py reset
+```
+
+Optional custom name (e.g. `2026-12` or `Cycle 2`):
+
+```bash
+python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py reset --name "2026-12"
+```
+
+- Preserves all previous cycles intact in Notion (grouped under their own `Cycle` section).
+- Creates the new cycle row starting at `0` (`Since = now`).
+- All other family members' devices automatically detect the newer `Cycle` on their next sync and switch over with zero manual steps!
+
+### 5. Configure Start Date (`since`), Member Name, or Optional Quotas
 
 - Count from a specific date (e.g. start of month):
   ```bash
