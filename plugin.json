@@ -1,7 +1,7 @@
 {
   "name": "family-token-tracker",
   "displayName": "Family Token Tracker / 家庭 Token 统计",
-  "description": "Automatically tracks Antigravity token usage per device using the logged-in account (no quota cap by default) and syncs to a shared Notion dashboard by link. / 自动记录每台设备的 Antigravity Token 消耗，默认使用当前登录账号且不设上限，发送 Notion 看板链接即可同步至家庭共享看板。",
+  "description": "Automatically tracks Antigravity token usage per device using the logged-in account (no quota cap by default) and auto-syncs to a shared Notion dashboard with zero extra LLM calls. / 自动记录每台设备的 Antigravity Token 消耗，默认使用当前登录账号且不设上限，支持每次对话结束零模型消耗自动同步至家庭共享 Notion 看板。",
   "version": "1.0.0",
   "author": "LiuMengxuan04",
   "homepage": "https://github.com/LiuMengxuan04/Gemini-family-token-tracker",
