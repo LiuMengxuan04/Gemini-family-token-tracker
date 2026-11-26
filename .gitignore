@@ -1,0 +1,9 @@
+# Local runtime data & caches
+data/
+__pycache__/
+*.py[cod]
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+.DS_Store

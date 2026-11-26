@@ -1,0 +1,18 @@
+{
+  "family-token-tracker": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python3 ./scripts/tracker.py hook-pre-invocation",
+        "timeout": 10
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 ./scripts/tracker.py hook-stop",
+        "timeout": 10
+      }
+    ]
+  }
+}
