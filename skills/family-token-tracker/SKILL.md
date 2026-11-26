@@ -44,8 +44,9 @@ python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py <subcom
 When `notion.data_source_id` is empty and the user wants to sync (or sends a
 Notion URL):
 
-1. If the user has not provided a link yet, reply briefly:
-   > 「请直接把家庭共享的 Notion 看板链接发给我，我会自动绑定并同步你的 Token 消耗。（如果还没有创建看板，也可以告诉我帮你新建一个。）」
+1. If the user has not provided a link yet, reply briefly (in the user's language, or bilingual if unclear):
+   > Please send your shared family Notion dashboard link and I will bind it and sync your token usage automatically. (If you don't have one yet, let me know and I can create one for you.)
+   > 请直接把家庭共享的 Notion 看板链接发给我，我会自动绑定并同步你的 Token 消耗。（如果还没有创建看板，也可以告诉我帮你新建一个。）
 2. Once the user sends the Notion database URL:
    - Call `notion_notion` tool `notion-fetch` with the URL to retrieve the
      database metadata and its `collection://...` data source URL.

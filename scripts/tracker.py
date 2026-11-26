@@ -329,11 +329,11 @@ def cmd_hook_pre_invocation(_args: argparse.Namespace) -> None:
                 if pct >= 100.0:
                     exceeded = True
                     alerts.append(
-                        f"今日已用 **{fmt_num(daily_used)}** / {fmt_num(daily_limit)}（{pct:.0f}%，已超额）"
+                        f"Today / 今日: **{fmt_num(daily_used)}** / {fmt_num(daily_limit)} ({pct:.0f}%, exceeded / 已超额)"
                     )
                 elif pct >= warn_pct:
                     alerts.append(
-                        f"今日已用 **{fmt_num(daily_used)}** / {fmt_num(daily_limit)}（{pct:.0f}%）"
+                        f"Today / 今日: **{fmt_num(daily_used)}** / {fmt_num(daily_limit)} ({pct:.0f}%)"
                     )
 
             if monthly_limit > 0:
@@ -341,11 +341,11 @@ def cmd_hook_pre_invocation(_args: argparse.Namespace) -> None:
                 if pct >= 100.0:
                     exceeded = True
                     alerts.append(
-                        f"本月已用 **{fmt_num(monthly_used)}** / {fmt_num(monthly_limit)}（{pct:.0f}%，已超额）"
+                        f"This Month / 本月: **{fmt_num(monthly_used)}** / {fmt_num(monthly_limit)} ({pct:.0f}%, exceeded / 已超额)"
                     )
                 elif pct >= warn_pct:
                     alerts.append(
-                        f"本月已用 **{fmt_num(monthly_used)}** / {fmt_num(monthly_limit)}（{pct:.0f}%）"
+                        f"This Month / 本月: **{fmt_num(monthly_used)}** / {fmt_num(monthly_limit)} ({pct:.0f}%)"
                     )
 
             if alerts:
@@ -355,10 +355,10 @@ def cmd_hook_pre_invocation(_args: argparse.Namespace) -> None:
                     mark_reminded(conn, alert_key)
                     icon = "🚨" if exceeded else "⚠️"
                     member = cfg.get("member") or getpass.getuser()
-                    summary = "；".join(alerts)
+                    summary = " | ".join(alerts)
                     markdown = (
-                        f"> {icon} **家庭 Token 额度提醒（{member}）**：{summary}。"
-                        "本次仅温和提醒、不打断对话；可随时说「同步并查看家庭 Token 额度」查看全家汇总。"
+                        f"> {icon} **Family Token Quota Notice / 家庭 Token 额度提醒 ({member})**: {summary}. "
+                        "Gentle reminder only — your chat continues normally. / 仅温和提醒，不打断当前对话。"
                     )
                     output = {
                         "injectSteps": [
