@@ -82,20 +82,25 @@ Call `notion_notion` tool `notion-create-database` with:
   ```sql
   CREATE TABLE (
     "Record" TITLE,
-    "Member" SELECT,
-    "Device" RICH_TEXT,
     "Progress" RICH_TEXT,
+    "Billable Tokens" NUMBER,
+    "Calls" NUMBER,
     "Since" DATE,
     "Last Updated" DATE,
-    "Billable Tokens" NUMBER,
+    "Member" SELECT,
+    "Device" RICH_TEXT,
     "Input Tokens" NUMBER,
     "Output Tokens" NUMBER,
     "Cache Read Tokens" NUMBER,
     "Total Tokens" NUMBER,
-    "Calls" NUMBER,
     "Sync Key" RICH_TEXT
   )
   ```
+
+After creating the database, optionally call `notion-update-view` on its default
+view so `"Progress"` is placed immediately after `"Record"` and `"Sync Key"` is
+hidden:
+`SHOW "Record", "Progress", "Billable Tokens", "Calls", "Since", "Last Updated", "Device", "Input Tokens", "Output Tokens", "Cache Read Tokens", "Total Tokens", "Member"; HIDE "Sync Key"; WIDTH "Progress" 320; SORT BY "Billable Tokens" DESC`.
 
 Save the URL/ID via `tracker.py config` and display the **Sharing & Permissions
 Guide** above.
