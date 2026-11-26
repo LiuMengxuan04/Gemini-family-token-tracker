@@ -6,15 +6,15 @@
 
 ## English
 
-An **Antigravity** plugin for family-shared accounts. It automatically records per-device token usage into a local SQLite database using the current logged-in OS username (with **no quota cap** by default), and supports **zero-LLM background auto-sync** to a shared **Notion** dashboard after every conversation turn.
+An **Antigravity** plugin for family-shared accounts. It automatically tracks per-device token usage into a local SQLite database using the logged-in OS username (with **no quota cap** by default), counts from a **configurable start date** (defaulting to the exact moment the plugin is installed), and syncs **one clean summary row per member with a visual progress bar** to a shared **Notion** dashboard after every conversation turn with **zero extra LLM calls**.
 
 ### Features
 
-- **Automatic Zero-Friction Tracking**: Uses Antigravity `Stop` and `PreInvocation` lifecycle hooks to parse local `transcript.jsonl` logs and deduplicate by `(conversation_id, step_index)`, recording `input_tokens`, `cache_read_tokens`, `output_tokens`, and model name.
-- **Zero-LLM Auto-Sync on Every Turn (Default)**: When bound with a Notion dashboard link and a free Notion Internal Integration Token, every `Stop` hook spawns a detached background process that pushes directly to the Notion REST API — **0 extra LLM calls, 0 added chat latency**.
-- **Ready Out of the Box (No Quota Limit by Default)**: Automatically uses the current system login account (`getpass.getuser()`) as the member name. Daily and monthly limits default to `0` (unlimited) — records and syncs without interrupting your workflow.
-- **MCP / Scheduled Sync Fallback**: Don't want to create an Integration Token? You can still bind the Notion dashboard link via the installed Antigravity Notion plugin and use `/schedule` for daily scheduled sync.
-- **Privacy First**: Only aggregated token counts, dates, model names, and device names are synced — **no conversation content is ever uploaded**.
+- **Clean Member Summary + Progress Bar**: Instead of flooding Notion with per-day/per-model rows, each family member has **one summary row** showing a visual progress bar (`🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜ 3.62M (219 calls)`, or `🟩🟩🟩🟩🟩🟩⬜⬜⬜⬜ 62.5%` if a quota is set), total Billable Tokens, Calls, Start Date (`Since`), and `Last Updated`.
+- **Configurable Start Date (`since`)**: Automatically starts counting from the moment the plugin is installed on each device. You can change it anytime to any date (e.g. `--since 2026-11-01`), reset to now (`--since now`), or count all history (`--since all`).
+- **Zero-LLM Auto-Sync on Every Turn (Default)**: When configured with a Notion dashboard link and a free Notion Internal Integration Token, every `Stop` hook spawns a detached background process that updates your summary row directly via the Notion REST API — **0 extra LLM calls, 0 added chat latency**.
+- **Ready Out of the Box (No Quota Limit by Default)**: Automatically uses the current system login account (`getpass.getuser()`) as the member name. Daily and monthly limits default to `0` (unlimited).
+- **Privacy First**: Only aggregated token totals and device/member metadata are synced — **no conversation content is ever uploaded**.
 
 ### Installation
 
@@ -33,7 +33,7 @@ git clone https://github.com/LiuMengxuan04/Gemini-family-token-tracker.git \
 
 > No restart required — Antigravity automatically discovers and enables `Family Token Tracker / 家庭 Token 统计`.
 
-#### Step 2: Create or bind the shared Notion dashboard
+#### Step 2: Create the Notion dashboard & grant edit access
 
 - **Family Admin (First-time setup)**:
   Ask Antigravity in chat:
@@ -47,11 +47,9 @@ git clone https://github.com/LiuMengxuan04/Gemini-family-token-tracker.git \
 
 #### Step 3: Enable Zero-LLM Automatic Sync After Every Turn (Recommended)
 
-To sync silently after every turn without spending any extra model tokens:
-
 1. Create a free Internal Integration at https://www.notion.so/profile/integrations and copy its token (`ntn_...`).
 2. Open your shared Notion dashboard → click **`···` (top right) → Connections → Connect to** your integration.
-3. On each family member's computer, bind the dashboard link and token once (either in Antigravity chat or via terminal):
+3. On each family member's computer, bind the dashboard link and token once:
 
 ```bash
 python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py config \
@@ -60,54 +58,46 @@ python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py config 
   --auto-sync true
 ```
 
-4. Run a one-time backfill + sync test:
+4. Run an initial sync:
 
 ```bash
-python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py backfill && \
-python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py sync-notion-direct
+python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py sync-notion-direct --force
 ```
 
-From then on, every conversation turn will automatically sync to Notion in the background with **zero extra model calls**.
+From then on, every conversation turn automatically updates your single summary row in Notion with **zero extra model calls**.
 
-> **Without an Integration Token**: Family members can simply paste the Notion dashboard link in Antigravity chat (`"Bind this family Notion dashboard and sync: <link>"`) and optionally use `/schedule` for daily scheduled sync.
-
-### Common Chat Prompts
-
-- **Sync to Notion**: `Sync my token usage to our family Notion dashboard`
-- **Local summary**: `Show my token usage summary for today and this month`
-- **Family breakdown**: `Show our family's monthly token usage breakdown from Notion`
-
-### Local Storage & Optional Configuration
-
-- **Data directory**: `~/.gemini/antigravity/plugin_data/family-token-tracker/`
-  - `usage.db`: Local SQLite database of token events and Notion sync state
-  - `config.json`: Local settings (`auto_sync: true`, `daily_limit: 0`, `monthly_limit: 0` by default)
-  - `last_sync.json`: Timestamp and result of the latest direct auto-sync
+### Configure Start Date (`since`) & Optional Settings
 
 ```bash
-# View current configuration
+# View current config (default `since` = plugin install timestamp)
 python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py config
 
-# Optional: override member name or enable gentle quota reminders (0 = unlimited)
-python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py config \
-  --member "YourName" \
-  --daily-limit 0 \
-  --monthly-limit 0
+# Count starting from a specific date (e.g. billing cycle start)
+python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py config --since 2026-11-01
+
+# Reset counter to right now
+python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py config --since now
+
+# Count all local history (after running `backfill`)
+python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py config --since all
+
+# Optional: set a reference quota so the progress bar shows percentage (0 = unlimited)
+python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py config --monthly-limit 50000000
 ```
 
 ---
 
 ## 中文说明
 
-一款用于 **Antigravity** 的家庭共享账号 Token 消耗统计插件。自动记录每台设备的 Token 消耗，默认使用当前电脑登录账号作为用户名、**不设额度上限**，并支持**零模型消耗的后台自动同步**——每次对话结束后自动静默同步到家庭共享 Notion 看板。
+一款用于 **Antigravity** 的家庭共享账号 Token 消耗统计插件。自动记录每台设备的 Token 消耗，默认使用当前电脑登录账号作为用户名、**不设额度上限**、**默认从插件安装那一刻开始累计**（可随时配置从任意日期开始），每次对话结束后在后台**零模型消耗**自动更新 Notion 看板上**每位成员唯一的一行汇总进度条**。
 
 ### 功能特点
 
-- **零感自动记录**：通过 Antigravity `Stop` / `PreInvocation` 生命周期钩子自动解析本地对话日志（`transcript.jsonl`），按 `(conversation_id, step_index)` 精确去重记录 `input_tokens`、`cache_read_tokens`、`output_tokens` 与模型名称。
-- **默认自动同步（零额外模型消耗）**：配置 Notion 看板链接和免费的 Notion Integration Token 后，每次对话结束（`Stop` 钩子）会自动拉起后台静默进程直连 Notion REST API 完成同步——**不额外调用大模型、不消耗任何额外 Token、不阻塞对话**。
-- **开箱即用、默认不限额**：自动读取当前电脑的登录用户名作为成员名，默认不设置任何每日/每月上限（仅记录和同步上传，不打断正常使用）。
-- **兼容 Notion 插件定时同步**：如果不想申请 Integration Token，也可以直接把 Notion 看板链接发给助手绑定，并配合 `/schedule` 做每日定时同步。
-- **隐私安全**：仅上传聚合后的 Token 数量、日期、模型与设备名，**绝不上传任何对话正文内容**。
+- **极简汇总看板 + 进度条展示**：不再按天/按模型刷屏，每位家庭成员在 Notion 看板中只占**一行总汇总**，自带可视化进度条（不限额时显示消耗刻度条 `🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜ 3.62M (219 calls)`；设置参考额度后显示百分比进度条 `🟩🟩🟩🟩🟩🟩⬜⬜⬜⬜ 62.5%`）、起始统计时间（`Since`）与最后更新时间（`Last Updated`）。
+- **支持自定义起始日期（`since`）**：默认自动从插件安装/首次初始化的那一刻开始统计，也可随时设置为指定日期（如账单日 `--since 2026-11-01`）、立即归零重算（`--since now`）或统计全部历史（`--since all`）。
+- **默认自动同步（零额外模型消耗）**：配置 Notion 看板链接和免费的 Notion Integration Token 后，每次对话结束（`Stop` 钩子）会自动拉起后台静默进程直连 Notion REST API 更新自己的汇总行——**不额外调用大模型、零 Token 消耗、不阻塞对话**。
+- **开箱即用、默认不限额**：自动读取当前电脑的登录用户名作为成员名，默认不设置任何每日/每月上限。
+- **隐私安全**：仅上传聚合后的 Token 总数、设备名与成员名，**绝不上传任何对话正文内容**。
 
 ### 安装说明
 
@@ -126,7 +116,7 @@ git clone https://github.com/LiuMengxuan04/Gemini-family-token-tracker.git \
   ~/.gemini/config/plugins/family-token-tracker
 ```
 
-> 安装完成后无需重启，Antigravity 会自动发现并启用 `Family Token Tracker / 家庭 Token 统计` 插件（也可在 Customizations 页面查看开关状态）。
+> 安装完成后无需重启，Antigravity 会自动发现并启用 `Family Token Tracker / 家庭 Token 统计` 插件。
 
 #### 第二步：创建看板并配置共享权限
 
@@ -155,41 +145,29 @@ python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py config 
   --auto-sync true
 ```
 
-4. 立即执行一次历史回溯与直连同步测试：
+4. 立即执行一次首次同步：
 
 ```bash
-python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py backfill && \
-python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py sync-notion-direct
+python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py sync-notion-direct --force
 ```
 
-配置完成后，以后**每次对话结束都会在后台静默自动同步到 Notion，完全不消耗额外模型 Token**。
+配置完成后，以后**每次对话结束都会在后台静默自动更新你的那一行汇总进度条，完全不消耗额外模型 Token**。
 
-> **如果不配置 Integration Token**：家庭成员也可以直接把 Notion 看板链接发给助手（「帮我绑定这个家庭 Token 看板并同步我的消耗：`<链接>`」），并配合 `/schedule` 设置每日定时同步。
-
-### 日常常用指令
-
-安装完成后，直接在 Antigravity 对话中使用自然语言即可：
-
-- **手动同步数据**：`把我的 Token 消耗同步到家庭 Notion 看板`
-- **查看本机统计**：`查看我今天和本月的 Token 消耗统计`
-- **查看全家汇总**：`从 Notion 查看全家本月的 Token 消耗排名`
-
-### 数据存储与可选配置
-
-- **本地数据目录**：`~/.gemini/antigravity/plugin_data/family-token-tracker/`
-  - `usage.db`：本地 SQLite 消耗明细与 Notion 同步状态
-  - `config.json`：本机配置（默认 `auto_sync: true`、`daily_limit: 0`、`monthly_limit: 0`）
-  - `last_sync.json`：最近一次直连自动同步的时间与结果
-
-如需手动调整成员名或开启可选的额度温和提醒，可以直接对助手说，或运行 CLI：
+### 配置起始日期（`since`）与可选设置
 
 ```bash
-# 查看当前配置
+# 查看当前配置（since 默认为插件安装/首次初始化时刻）
 python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py config
 
-# 可选：自定义成员名或设置日/月额度提醒（0 表示不限额）
-python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py config \
-  --member "你的名字" \
-  --daily-limit 0 \
-  --monthly-limit 0
+# 配置从指定日期开始统计（例如每月账单日）
+python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py config --since 2026-11-01
+
+# 从此刻重新开始累计
+python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py config --since now
+
+# 统计本机全部历史记录（配合 backfill）
+python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py config --since all
+
+# 可选：设置参考额度，让进度条显示百分比（0 表示不限额）
+python3 ~/.gemini/config/plugins/family-token-tracker/scripts/tracker.py config --monthly-limit 50000000
 ```

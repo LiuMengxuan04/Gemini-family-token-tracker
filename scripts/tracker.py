@@ -2,9 +2,10 @@
 """Family Token Tracker for Antigravity.
 
 Tracks token consumption from Antigravity transcript.jsonl files into a local
-SQLite database, supports zero-LLM background auto-sync to Notion via the
-official Notion REST API on every Stop hook, and prepares daily aggregated
-records for Notion MCP fallback sync.
+SQLite database, aggregates total usage per member+device starting from a
+configurable `since` date/timestamp (defaulting to plugin installation time),
+and supports zero-LLM background auto-sync to a shared Notion dashboard with a
+visual progress bar.
 """
 
 from __future__ import annotations
@@ -39,22 +40,29 @@ LAST_SYNC_PATH = DATA_DIR / "last_sync.json"
 NOTION_API_BASE = "https://api.notion.com/v1"
 NOTION_API_VERSION = "2022-06-28"
 
-DEFAULT_CONFIG: Dict[str, Any] = {
-    "member": getpass.getuser(),
-    "device": socket.gethostname().split(".")[0],
-    "daily_limit": 0,
-    "monthly_limit": 0,
-    "count_cache_read": False,
-    "warn_threshold_pct": 80,
-    "remind_cooldown_minutes": 60,
-    "auto_sync": True,
-    "notion": {
-        "database_url": "",
-        "database_id": "",
-        "data_source_id": "",
-        "api_token": "",
-    },
-}
+
+def utc_now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def default_config() -> Dict[str, Any]:
+    return {
+        "member": getpass.getuser(),
+        "device": socket.gethostname().split(".")[0],
+        "since": utc_now_iso(),
+        "daily_limit": 0,
+        "monthly_limit": 0,
+        "count_cache_read": False,
+        "warn_threshold_pct": 80,
+        "remind_cooldown_minutes": 60,
+        "auto_sync": True,
+        "notion": {
+            "database_url": "",
+            "database_id": "",
+            "data_source_id": "",
+            "api_token": "",
+        },
+    }
 
 
 def ensure_data_dir() -> None:
@@ -66,14 +74,12 @@ def extract_notion_id(url_or_id: str) -> str:
     if not url_or_id:
         return ""
     cleaned = url_or_id.strip()
-    # Match dashed UUID
     m_uuid = re.search(
         r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
         cleaned,
     )
     if m_uuid:
         return m_uuid.group(1).replace("-", "").lower()
-    # Match 32-char hex ID (take the last one in URL path before query string)
     path_only = cleaned.split("?")[0].split("#")[0]
     matches = re.findall(r"([0-9a-fA-F]{32})", path_only)
     if matches:
@@ -81,22 +87,46 @@ def extract_notion_id(url_or_id: str) -> str:
     return ""
 
 
+def normalize_since(value: str) -> str:
+    """Normalize user-supplied --since value: 'now', 'all'/empty, YYYY-MM-DD, or ISO timestamp."""
+    v = value.strip()
+    if not v or v.lower() in ("all", "none", "clear"):
+        return ""
+    if v.lower() == "now":
+        return utc_now_iso()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
+        return v
+    # Try parsing ISO datetime and normalize to UTC Z string
+    try:
+        parsed = dt.datetime.fromisoformat(v.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.astimezone()
+        return parsed.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return v
+
+
 def load_config() -> Dict[str, Any]:
     ensure_data_dir()
     if not CONFIG_PATH.exists():
-        save_config(DEFAULT_CONFIG)
-        return json.loads(json.dumps(DEFAULT_CONFIG))
+        cfg = default_config()
+        save_config(cfg)
+        return cfg
     try:
         with CONFIG_PATH.open("r", encoding="utf-8") as f:
             raw = json.load(f)
     except Exception:
-        return json.loads(json.dumps(DEFAULT_CONFIG))
-    merged = json.loads(json.dumps(DEFAULT_CONFIG))
+        return default_config()
+    merged = default_config()
+    # Keep existing since if present (even if empty string ""), otherwise default to now
+    has_since = "since" in raw
     for k, v in raw.items():
         if k == "notion" and isinstance(v, dict):
             merged["notion"].update(v)
         else:
             merged[k] = v
+    if not has_since:
+        save_config(merged)
     if not merged["notion"].get("database_id") and merged["notion"].get("database_url"):
         merged["notion"]["database_id"] = extract_notion_id(merged["notion"]["database_url"])
     return merged
@@ -141,6 +171,7 @@ def open_db() -> sqlite3.Connection:
         );
         CREATE INDEX IF NOT EXISTS idx_token_events_date ON token_events(local_date);
         CREATE INDEX IF NOT EXISTS idx_token_events_month ON token_events(local_month);
+        CREATE INDEX IF NOT EXISTS idx_token_events_created ON token_events(created_at);
 
         CREATE TABLE IF NOT EXISTS notion_sync_log (
             sync_key TEXT PRIMARY KEY,
@@ -162,7 +193,6 @@ def open_db() -> sqlite3.Connection:
 
 
 def parse_utc_to_local_date(ts: str) -> Tuple[str, str]:
-    """Convert ISO8601 UTC timestamp to local (YYYY-MM-DD, YYYY-MM)."""
     now_local = dt.datetime.now().astimezone()
     if not ts:
         return now_local.strftime("%Y-%m-%d"), now_local.strftime("%Y-%m")
@@ -177,13 +207,21 @@ def parse_utc_to_local_date(ts: str) -> Tuple[str, str]:
         return now_local.strftime("%Y-%m-%d"), now_local.strftime("%Y-%m")
 
 
+def since_filter_sql(since: str) -> Tuple[str, Tuple[Any, ...]]:
+    """Return SQL WHERE clause and params for the configured `since` boundary."""
+    if not since:
+        return "1 = 1", ()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", since):
+        return "local_date >= ?", (since,)
+    return "created_at >= ?", (since,)
+
+
 def ingest_transcript(
     conn: sqlite3.Connection,
     transcript_path: str,
     conversation_id: str,
     cfg: Dict[str, Any],
 ) -> int:
-    """Parse transcript.jsonl and insert unseen PLANNER_RESPONSE token events."""
     if not transcript_path or not os.path.isfile(transcript_path):
         return 0
     member = str(cfg.get("member") or getpass.getuser())
@@ -210,7 +248,7 @@ def ingest_transcript(
                 out_tok = int(entry.get("output_tokens") or 0)
                 if in_tok == 0 and cache_tok == 0 and out_tok == 0:
                     continue
-                created_at = str(entry.get("created_at") or "")
+                created_at = str(entry.get("created_at") or utc_now_iso())
                 local_date, local_month = parse_utc_to_local_date(created_at)
                 model = str(entry.get("model") or "unknown")
                 rows.append(
@@ -292,6 +330,47 @@ def fmt_num(n: int) -> str:
     return str(n)
 
 
+def build_progress_bar(used: int, limit: int, calls: int) -> str:
+    """Build a visual Unicode progress bar for Notion display."""
+    width = 10
+    if limit > 0:
+        pct = (used / limit) * 100.0
+        filled = min(width, max(0, int(round((used / limit) * width))))
+        if pct >= 100.0:
+            bar = "🟥" * width
+        elif pct >= 80.0:
+            bar = "🟧" * filled + "⬜" * (width - filled)
+        else:
+            bar = "🟩" * filled + "⬜" * (width - filled)
+        return f"{bar} {pct:.1f}% ({fmt_num(used)} / {fmt_num(limit)})"
+
+    # Unlimited mode: show a clean logarithmic/stepped visual gauge + totals
+    if used <= 0:
+        filled = 0
+    elif used < 100_000:
+        filled = 1
+    elif used < 500_000:
+        filled = 2
+    elif used < 1_000_000:
+        filled = 3
+    elif used < 2_500_000:
+        filled = 4
+    elif used < 5_000_000:
+        filled = 5
+    elif used < 10_000_000:
+        filled = 6
+    elif used < 25_000_000:
+        filled = 7
+    elif used < 50_000_000:
+        filled = 8
+    elif used < 100_000_000:
+        filled = 9
+    else:
+        filled = 10
+    bar = "🟦" * filled + "⬜" * (width - filled)
+    return f"{bar} {fmt_num(used)} ({calls} calls)"
+
+
 def should_remind(conn: sqlite3.Connection, key: str, cooldown_minutes: int) -> bool:
     if cooldown_minutes <= 0:
         return True
@@ -322,7 +401,6 @@ def mark_reminded(conn: sqlite3.Connection, key: str) -> None:
 
 
 def spawn_background_sync(cfg: Dict[str, Any]) -> None:
-    """Spawn a detached zero-LLM Notion REST sync if auto_sync & api_token are configured."""
     if not cfg.get("auto_sync", True):
         return
     notion = cfg.get("notion") or {}
@@ -382,9 +460,14 @@ def cmd_hook_pre_invocation(_args: argparse.Namespace) -> None:
             now_local = dt.datetime.now().astimezone()
             today_str = now_local.strftime("%Y-%m-%d")
             month_str = now_local.strftime("%Y-%m")
+            s_sql, s_params = since_filter_sql(str(cfg.get("since") or ""))
 
-            daily_totals = query_period_totals(conn, "local_date = ?", (today_str,))
-            monthly_totals = query_period_totals(conn, "local_month = ?", (month_str,))
+            daily_totals = query_period_totals(
+                conn, f"local_date = ? AND ({s_sql})", (today_str, *s_params)
+            )
+            monthly_totals = query_period_totals(
+                conn, f"local_month = ? AND ({s_sql})", (month_str, *s_params)
+            )
 
             daily_used = counted_tokens(daily_totals, cfg)
             monthly_used = counted_tokens(monthly_totals, cfg)
@@ -446,84 +529,68 @@ def cmd_hook_pre_invocation(_args: argparse.Namespace) -> None:
     print(json.dumps(output, ensure_ascii=False))
 
 
-def get_pending_items(conn: sqlite3.Connection, force: bool = False) -> List[Dict[str, Any]]:
-    rows = conn.execute(
-        """
-        SELECT
-            e.local_date,
-            e.member,
-            e.device,
-            e.model,
-            SUM(e.input_tokens) AS input_tokens,
-            SUM(e.cache_read_tokens) AS cache_read_tokens,
-            SUM(e.output_tokens) AS output_tokens,
-            COUNT(*) AS calls
-        FROM token_events e
-        GROUP BY e.local_date, e.member, e.device, e.model
-        ORDER BY e.local_date DESC, e.model ASC
-        """
-    ).fetchall()
+def get_summary_pending_item(
+    conn: sqlite3.Connection, cfg: Dict[str, Any], force: bool = False
+) -> List[Dict[str, Any]]:
+    """Build the single aggregated summary row for this member+device since `cfg['since']`."""
+    member = str(cfg.get("member") or getpass.getuser())
+    device = str(cfg.get("device") or socket.gethostname().split(".")[0])
+    since = str(cfg.get("since") or "")
+    s_sql, s_params = since_filter_sql(since)
 
-    synced_map = {
-        r["sync_key"]: dict(r)
-        for r in conn.execute("SELECT * FROM notion_sync_log").fetchall()
-    }
+    totals = query_period_totals(conn, s_sql, s_params)
+    sync_key = f"summary|{member}|{device}"
 
-    pending: List[Dict[str, Any]] = []
-    for r in rows:
-        sync_key = f"{r['local_date']}|{r['member']}|{r['device']}|{r['model']}"
-        in_tok = int(r["input_tokens"])
-        cache_tok = int(r["cache_read_tokens"])
-        out_tok = int(r["output_tokens"])
-        calls = int(r["calls"])
-        billable = in_tok + out_tok
-        total = in_tok + cache_tok + out_tok
+    prev_row = conn.execute(
+        "SELECT * FROM notion_sync_log WHERE sync_key = ?", (sync_key,)
+    ).fetchone()
+    prev = dict(prev_row) if prev_row else None
 
-        prev = synced_map.get(sync_key)
-        if prev and not force:
-            if (
-                prev["last_synced_input"] == in_tok
-                and prev["last_synced_cache_read"] == cache_tok
-                and prev["last_synced_output"] == out_tok
-                and prev["last_synced_calls"] == calls
-            ):
-                continue
+    if prev and not force:
+        if (
+            prev["last_synced_input"] == totals["input_tokens"]
+            and prev["last_synced_cache_read"] == totals["cache_read_tokens"]
+            and prev["last_synced_output"] == totals["output_tokens"]
+            and prev["last_synced_calls"] == totals["calls"]
+        ):
+            return []
 
-        pending.append(
-            {
-                "action": "update" if prev else "create",
-                "sync_key": sync_key,
-                "notion_page_id": prev["notion_page_id"] if prev else None,
-                "local_date": r["local_date"],
-                "member": r["member"],
-                "device": r["device"],
-                "model": r["model"],
-                "properties": {
-                    "Record": f"{r['local_date']} · {r['member']} · {r['model']}",
-                    "date:Date:start": r["local_date"],
-                    "date:Date:is_datetime": 0,
-                    "Member": r["member"],
-                    "Device": r["device"],
-                    "Model": r["model"],
-                    "Input Tokens": in_tok,
-                    "Cache Read Tokens": cache_tok,
-                    "Output Tokens": out_tok,
-                    "Billable Tokens": billable,
-                    "Total Tokens": total,
-                    "Calls": calls,
-                    "Sync Key": sync_key,
-                },
-                "raw": {
-                    "input_tokens": in_tok,
-                    "cache_read_tokens": cache_tok,
-                    "output_tokens": out_tok,
-                    "billable_tokens": billable,
-                    "total_tokens": total,
-                    "calls": calls,
-                },
-            }
-        )
-    return pending
+    used = counted_tokens(totals, cfg)
+    limit = int(cfg.get("monthly_limit") or cfg.get("daily_limit") or 0)
+    progress_text = build_progress_bar(used, limit, totals["calls"])
+    now_iso = utc_now_iso()
+    since_date_val = since if since else dt.datetime.now().astimezone().strftime("%Y-%m-%d")
+
+    return [
+        {
+            "action": "update" if prev else "create",
+            "sync_key": sync_key,
+            "notion_page_id": prev["notion_page_id"] if prev else None,
+            "member": member,
+            "device": device,
+            "since": since_date_val,
+            "progress": progress_text,
+            "last_updated": now_iso,
+            "properties": {
+                "Record": member,
+                "Member": member,
+                "Device": device,
+                "Progress": progress_text,
+                "date:Since:start": since_date_val,
+                "date:Since:is_datetime": 1 if "T" in since_date_val else 0,
+                "date:Last Updated:start": now_iso,
+                "date:Last Updated:is_datetime": 1,
+                "Input Tokens": totals["input_tokens"],
+                "Cache Read Tokens": totals["cache_read_tokens"],
+                "Output Tokens": totals["output_tokens"],
+                "Billable Tokens": totals["billable_tokens"],
+                "Total Tokens": totals["total_tokens"],
+                "Calls": totals["calls"],
+                "Sync Key": sync_key,
+            },
+            "raw": totals,
+        }
+    ]
 
 
 def notion_api_request(
@@ -545,15 +612,34 @@ def notion_api_request(
         return json.loads(resp.read().decode("utf-8"))
 
 
+def ensure_summary_schema(token: str, db_id: str) -> None:
+    """Ensure the target Notion database has Progress, Since, and Last Updated properties."""
+    try:
+        notion_api_request(
+            token,
+            "PATCH",
+            f"/databases/{db_id}",
+            {
+                "properties": {
+                    "Progress": {"rich_text": {}},
+                    "Since": {"date": {}},
+                    "Last Updated": {"date": {}},
+                }
+            },
+        )
+    except Exception:
+        pass
+
+
 def build_notion_rest_properties(item: Dict[str, Any]) -> Dict[str, Any]:
     raw = item["raw"]
-    title = f"{item['local_date']} · {item['member']} · {item['model']}"
     return {
-        "Record": {"title": [{"text": {"content": title}}]},
-        "Date": {"date": {"start": item["local_date"]}},
+        "Record": {"title": [{"text": {"content": item["member"]}}]},
         "Member": {"select": {"name": item["member"]}},
         "Device": {"rich_text": [{"text": {"content": item["device"]}}]},
-        "Model": {"select": {"name": item["model"]}},
+        "Progress": {"rich_text": [{"text": {"content": item["progress"]}}]},
+        "Since": {"date": {"start": item["since"]}},
+        "Last Updated": {"date": {"start": item["last_updated"]}},
         "Input Tokens": {"number": raw["input_tokens"]},
         "Cache Read Tokens": {"number": raw["cache_read_tokens"]},
         "Output Tokens": {"number": raw["output_tokens"]},
@@ -596,7 +682,7 @@ def upsert_sync_log(conn: sqlite3.Connection, item: Dict[str, Any], page_id: str
 
 
 def cmd_sync_notion_direct(args: argparse.Namespace) -> None:
-    """Zero-LLM direct sync to Notion REST API."""
+    """Zero-LLM direct sync of the single member summary row to Notion REST API."""
     ensure_data_dir()
     cfg = load_config()
     notion = cfg.get("notion") or {}
@@ -623,15 +709,29 @@ def cmd_sync_notion_direct(args: argparse.Namespace) -> None:
         conn = open_db()
         created = 0
         updated = 0
+        archived_legacy = 0
         errors: List[str] = []
         try:
-            pending = get_pending_items(conn, force=args.force)
+            if args.cleanup_legacy:
+                ensure_summary_schema(token, db_id)
+                q_all = notion_api_request(token, "POST", f"/databases/{db_id}/query", {"page_size": 100})
+                for p in q_all.get("results") or []:
+                    sk_prop = (p.get("properties") or {}).get("Sync Key", {}).get("rich_text") or []
+                    sk_val = "".join(t.get("plain_text", "") for t in sk_prop)
+                    if not sk_val.startswith("summary|"):
+                        notion_api_request(token, "PATCH", f"/pages/{p['id']}", {"archived": True})
+                        archived_legacy += 1
+                conn.execute("DELETE FROM notion_sync_log WHERE sync_key NOT LIKE 'summary|%'")
+                conn.commit()
+
+            pending = get_summary_pending_item(conn, cfg, force=args.force or args.cleanup_legacy)
             for item in pending:
                 try:
                     props = build_notion_rest_properties(item)
                     page_id = item.get("notion_page_id")
 
                     if not page_id:
+                        ensure_summary_schema(token, db_id)
                         q_res = notion_api_request(
                             token,
                             "POST",
@@ -681,9 +781,10 @@ def cmd_sync_notion_direct(args: argparse.Namespace) -> None:
 
         status = {
             "ok": len(errors) == 0,
-            "synced_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "synced_at": utc_now_iso(),
             "created": created,
             "updated": updated,
+            "archived_legacy": archived_legacy,
             "errors": errors,
         }
         save_last_sync(status)
@@ -718,6 +819,7 @@ def cmd_backfill(_args: argparse.Namespace) -> None:
             {
                 "scanned_transcripts": scanned_files,
                 "new_events_imported": total_inserted,
+                "since": cfg.get("since", ""),
                 "db_path": str(DB_PATH),
             },
             ensure_ascii=False,
@@ -742,6 +844,9 @@ def cmd_config(args: argparse.Namespace) -> None:
         changed = True
     if args.device is not None:
         cfg["device"] = args.device.strip()
+        changed = True
+    if args.since is not None:
+        cfg["since"] = normalize_since(args.since)
         changed = True
     if args.daily_limit is not None:
         cfg["daily_limit"] = max(0, int(args.daily_limit))
@@ -790,20 +895,22 @@ def cmd_report(args: argparse.Namespace) -> None:
     today_str = now_local.strftime("%Y-%m-%d")
     month_str = now_local.strftime("%Y-%m")
     week_start = (now_local - dt.timedelta(days=6)).strftime("%Y-%m-%d")
+    s_sql, s_params = since_filter_sql(str(cfg.get("since") or ""))
 
     if args.period == "today":
-        where_sql, params = "local_date = ?", (today_str,)
+        where_sql, params = f"local_date = ? AND ({s_sql})", (today_str, *s_params)
     elif args.period == "week":
-        where_sql, params = "local_date >= ?", (week_start,)
+        where_sql, params = f"local_date >= ? AND ({s_sql})", (week_start, *s_params)
     elif args.period == "month":
-        where_sql, params = "local_month = ?", (month_str,)
+        where_sql, params = f"local_month = ? AND ({s_sql})", (month_str, *s_params)
+    elif args.period == "since":
+        where_sql, params = s_sql, s_params
     else:
         where_sql, params = "1 = 1", ()
 
     try:
         summary = query_period_totals(conn, where_sql, params)
-        today_totals = query_period_totals(conn, "local_date = ?", (today_str,))
-        month_totals = query_period_totals(conn, "local_month = ?", (month_str,))
+        since_totals = query_period_totals(conn, s_sql, s_params)
 
         by_model = [
             dict(r)
@@ -823,33 +930,11 @@ def cmd_report(args: argparse.Namespace) -> None:
                 params,
             ).fetchall()
         ]
-
-        by_day = [
-            dict(r)
-            for r in conn.execute(
-                f"""
-                SELECT local_date,
-                       SUM(input_tokens) AS input_tokens,
-                       SUM(cache_read_tokens) AS cache_read_tokens,
-                       SUM(output_tokens) AS output_tokens,
-                       SUM(input_tokens + output_tokens) AS billable_tokens,
-                       COUNT(*) AS calls
-                FROM token_events
-                WHERE {where_sql}
-                GROUP BY local_date
-                ORDER BY local_date DESC
-                LIMIT 31
-                """,
-                params,
-            ).fetchall()
-        ]
     finally:
         conn.close()
 
-    daily_used = counted_tokens(today_totals, cfg)
-    monthly_used = counted_tokens(month_totals, cfg)
-    daily_limit = int(cfg.get("daily_limit") or 0)
-    monthly_limit = int(cfg.get("monthly_limit") or 0)
+    used = counted_tokens(since_totals, cfg)
+    limit = int(cfg.get("monthly_limit") or cfg.get("daily_limit") or 0)
 
     last_sync = None
     if LAST_SYNC_PATH.exists():
@@ -861,25 +946,18 @@ def cmd_report(args: argparse.Namespace) -> None:
     result = {
         "member": cfg["member"],
         "device": cfg["device"],
+        "since": cfg.get("since", ""),
         "period": args.period,
+        "progress": build_progress_bar(used, limit, since_totals["calls"]),
         "auto_sync": cfg.get("auto_sync", True),
         "direct_sync_ready": bool(
             (cfg.get("notion") or {}).get("api_token")
             and (cfg.get("notion") or {}).get("database_id")
         ),
         "last_direct_sync": last_sync,
-        "count_cache_read": cfg["count_cache_read"],
-        "quota": {
-            "today_used": daily_used,
-            "daily_limit": daily_limit,
-            "daily_pct": round((daily_used / daily_limit) * 100, 1) if daily_limit else None,
-            "month_used": monthly_used,
-            "monthly_limit": monthly_limit,
-            "monthly_pct": round((monthly_used / monthly_limit) * 100, 1) if monthly_limit else None,
-        },
         "summary": summary,
+        "since_totals": since_totals,
         "by_model": by_model,
-        "by_day": by_day,
         "notion": mask_config(cfg).get("notion", {}),
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -889,7 +967,7 @@ def cmd_notion_pending(args: argparse.Namespace) -> None:
     cfg = load_config()
     conn = open_db()
     try:
-        pending = get_pending_items(conn, force=args.force)
+        pending = get_summary_pending_item(conn, cfg, force=args.force)
     finally:
         conn.close()
 
@@ -897,6 +975,7 @@ def cmd_notion_pending(args: argparse.Namespace) -> None:
         json.dumps(
             {
                 "notion": mask_config(cfg).get("notion", {}),
+                "since": cfg.get("since", ""),
                 "pending_count": len(pending),
                 "items": pending,
             },
@@ -956,10 +1035,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync = sub.add_parser("sync-notion-direct")
     p_sync.add_argument("--force", action="store_true")
     p_sync.add_argument("--quiet", action="store_true")
+    p_sync.add_argument("--cleanup-legacy", action="store_true")
 
     p_cfg = sub.add_parser("config")
     p_cfg.add_argument("--member")
     p_cfg.add_argument("--device")
+    p_cfg.add_argument("--since")
     p_cfg.add_argument("--daily-limit", type=int)
     p_cfg.add_argument("--monthly-limit", type=int)
     p_cfg.add_argument("--warn-pct", type=int)
@@ -973,7 +1054,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_rep = sub.add_parser("report")
     p_rep.add_argument(
-        "--period", choices=["today", "week", "month", "all"], default="month"
+        "--period", choices=["since", "today", "week", "month", "all"], default="since"
     )
 
     p_pend = sub.add_parser("notion-pending")
